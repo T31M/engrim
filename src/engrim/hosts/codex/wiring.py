@@ -132,12 +132,13 @@ def _remove_mcp() -> None:
 
 def guidance_status() -> dict[str, object]:
     agents_path = os.path.join(home(), "AGENTS.md")
+    agents_content_path = _guidance_write_path(agents_path)
     override_path = os.path.join(home(), "AGENTS.override.md")
     managed = False
     present = False
     reason = "managed guidance is missing"
-    if os.path.exists(agents_path):
-        with open(agents_path, encoding="utf-8", errors="replace") as f:
+    if os.path.exists(agents_content_path):
+        with open(agents_content_path, encoding="utf-8", errors="replace") as f:
             content = f.read()
         try:
             managed = _instruction_span(content) is not None
@@ -244,8 +245,8 @@ def setup(engrim_bin: str, *, with_mcp: bool = False, dry_run: bool = False) -> 
         sys.exit(f"Codex hooks field must be a JSON object: {hooks_path}")
 
     existing_agents = ""
-    if os.path.exists(agents_path):
-        with open(agents_path, encoding="utf-8", errors="replace") as f:
+    if os.path.exists(agents_write_path):
+        with open(agents_write_path, encoding="utf-8", errors="replace") as f:
             existing_agents = f.read()
     try:
         updated_agents = _replace_instructions(existing_agents, AGENTS_BLOCK)
@@ -391,8 +392,8 @@ def uninstall(*, dry_run: bool = False) -> None:
     else:
         print(f"✓ Codex hooks already unwired from {hooks_path}")
 
-    if os.path.exists(agents_path):
-        with open(agents_path, encoding="utf-8", errors="replace") as f:
+    if os.path.exists(agents_write_path):
+        with open(agents_write_path, encoding="utf-8", errors="replace") as f:
             existing = f.read()
         try:
             updated = _replace_instructions(existing, None)

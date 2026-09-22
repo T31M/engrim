@@ -2,6 +2,7 @@
 import io
 import json
 import sqlite3
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -402,7 +403,7 @@ def test_doctor_reports_codex_guidance_and_optional_absent_mcp_as_healthy(
     monkeypatch.setenv("ENGRIM_EMBED", "off")
 
     def which(name):
-        return "/bin/echo" if name == "engrim" else "/usr/local/bin/codex"
+        return sys.executable if name == "engrim" else "/usr/local/bin/codex"
 
     monkeypatch.setattr(cli.shutil, "which", which)
     monkeypatch.setattr(codex_host.shutil, "which", which)
@@ -438,7 +439,7 @@ def test_doctor_fix_restores_codex_without_enabling_absent_mcp(
     calls = []
 
     def which(name):
-        return "/bin/echo" if name == "engrim" else "/usr/local/bin/codex"
+        return sys.executable if name == "engrim" else "/usr/local/bin/codex"
 
     def run(argv, **kwargs):
         calls.append(argv)
@@ -466,7 +467,7 @@ def test_doctor_fix_repairs_configured_codex_mcp(tmp_path, monkeypatch, capsys):
     calls = []
 
     def which(name):
-        return "/bin/echo" if name == "engrim" else "/usr/local/bin/codex"
+        return sys.executable if name == "engrim" else "/usr/local/bin/codex"
 
     def run(argv, **kwargs):
         calls.append(argv)
