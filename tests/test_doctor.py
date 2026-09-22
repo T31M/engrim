@@ -19,6 +19,10 @@ def test_hook_bin_cross_platform_resilience():
 
 def test_doctor_terminal_output(capsys, monkeypatch):
     with tempfile.TemporaryDirectory() as tmpdir:
+        monkeypatch.setenv("HOME", tmpdir)
+        monkeypatch.setenv("USERPROFILE", tmpdir)
+        monkeypatch.setenv("CODEX_HOME", str(Path(tmpdir) / ".codex"))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(Path(tmpdir) / ".config"))
         db_path = Path(tmpdir) / "test_memory.db"
         conn = connect(str(db_path))
         conn.execute("CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY, ts TEXT, project TEXT, type TEXT, summary TEXT, detail TEXT, status TEXT, tags TEXT, links TEXT, source TEXT, origin_agent TEXT)")

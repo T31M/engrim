@@ -121,7 +121,7 @@ TOOLS = [
                 "origin_agent": {
                     "type": "string",
                     "enum": list(ORIGIN_AGENTS),
-                    "description": "Origin agent identifier for provenance tracking ('antigravity', 'claude-code', 'cursor', 'cli', 'user').",
+                    "description": "Origin agent identifier for provenance tracking.",
                 },
             },
             "required": ["type", "summary"],
@@ -335,6 +335,8 @@ def serve(conn, inp=None, out=None) -> None:
                 detected_client = "claude-code"
             elif "cursor" in cname:
                 detected_client = "cursor"
+            elif "codex" in cname:
+                detected_client = "codex"
             elif "opencode" in cname:
                 detected_client = "opencode"
             elif "copilot" in cname:       # Copilot CLI identifies as "copilot-cli"

@@ -28,14 +28,18 @@ from the current directory, so one store serves many projects cleanly.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as _dt
 import hashlib
+import io
 import json
 import os
 import re
 import shutil
 import sqlite3
 import sys
+
+from engrim.hosts import command_has_marker as _cmd_has
 
 try:
     from engrim import __version__
@@ -45,7 +49,7 @@ except ImportError:
 DEFAULT_DB = os.path.expanduser("~/.engrim/memory.db")
 TYPES = ("decision", "fact", "feedback", "state", "reference", "user")
 STATUSES = ("active", "superseded", "done")
-ORIGIN_AGENTS = ("antigravity", "claude-code", "cursor", "opencode", "copilot", "cli", "user")
+ORIGIN_AGENTS = ("antigravity", "claude-code", "cursor", "codex", "opencode", "copilot", "cli", "user")
 # priority for the session-boot pack: how-to-work-with-user first, then state, then the rest
 _PRIO = {"user": 0, "feedback": 1, "state": 2, "decision": 3, "fact": 4, "reference": 5}
 
@@ -60,6 +64,8 @@ def _norm_agent(agent: str | None) -> str | None:
         return "claude-code"
     if a == "cursor":
         return "cursor"
+    if a in ("codex", "codex-cli", "codex_cli"):
+        return "codex"
     if a in ("opencode", "open-code", "open_code"):
         return "opencode"
     if a in ("copilot", "copilot-cli", "copilot_cli", "github-copilot"):
@@ -78,6 +84,7 @@ def _agent_display(agent: str | None) -> str:
         "antigravity": "Antigravity",
         "claude-code": "Claude Code",
         "cursor": "Cursor",
+        "codex": "Codex CLI",
         "opencode": "OpenCode",
         "copilot": "Copilot CLI",
         "cli": "CLI",
@@ -1343,15 +1350,6 @@ def _hook_bin(path: str) -> str:
     return '"' + clean.replace("\\", "/") + '"'
 
 
-def _cmd_has(command: str, marker: str) -> bool:
-    """Does an already-wired hook command carry this marker? Normalised so Windows spellings match.
-
-    `"C:/Users/.../engrim.EXE" hook` has to read as `engrim hook`, or re-running setup won't
-    recognise its own hooks and appends a duplicate group every time (setup is documented idempotent)."""
-    norm = command.replace("\\", "/").replace('"', "").replace("'", "").lower()
-    return marker in norm.replace(".exe", "")
-
-
 def _verify_hook_bin(engrim_bin: str):
     """Actually run the wired binary the way Claude Code will. Returns None if it works, else why not.
 
@@ -1534,107 +1532,14 @@ def _setup_cursor(engrim_bin: str, dry_run: bool = False) -> None:
 
 def _codex_home() -> str:
     """Return the Codex home directory, honoring the same override Codex uses."""
-    return os.path.abspath(os.path.expanduser(os.environ.get("CODEX_HOME") or "~/.codex"))
+    from engrim.hosts.codex import wiring as codex_host
+    return codex_host.home()
 
 
-def _codex_hook_commands(engrim_bin: str):
-    """Commands for the Codex-native hook events.
-
-    Codex sends one JSON object on stdin for every command hook. The command hooks deliberately
-    swallow helper failures so a local memory integration can never interrupt the coding session.
-    The hook itself still emits Codex-compatible JSON on the two context-producing events.
-    Includes a self-healing PATH fallback in case engrim_bin is relocated or cross-OS.
-    """
-    return {
-        "SessionStart": (
-            f"{engrim_bin} hook --agent codex --event sessionstart 2>/dev/null || engrim hook --agent codex --event sessionstart 2>/dev/null || true",
-            20,
-        ),
-        "SessionEnd": (
-            f"{engrim_bin} log --hook --agent codex 2>/dev/null || engrim log --hook --agent codex 2>/dev/null || true",
-            3,
-        ),
-        "Stop": (
-            f"{engrim_bin} log --hook --agent codex 2>/dev/null || engrim log --hook --agent codex 2>/dev/null || true",
-            30,
-        ),
-        "UserPromptSubmit": (
-            f"{engrim_bin} assist 2>/dev/null || engrim assist 2>/dev/null || true",
-            20,
-        ),
-    }
-
-
-def _setup_codex(engrim_bin: str, dry_run: bool = False) -> None:
-    """Wire Codex to engrim through command hooks.
-
-    MCP is intentionally not part of this path. Codex can run the same local CLI commands as Claude
-    Code, while MCP remains an optional manual integration for users who want model-invoked tools.
-    """
-    print("Wiring Codex CLI environment…")
-    hooks_path = os.path.join(_codex_home(), "hooks.json")
-    commands = _codex_hook_commands(engrim_bin)
-    if dry_run:
-        print(f"[dry-run] Would wire Codex hooks in {hooks_path}")
-        for event, (command, _timeout) in commands.items():
-            print(f"    {event}: {command}")
-        print("[dry-run] Codex hooks must be reviewed and trusted with /hooks before they run")
-        return
-
-    os.makedirs(os.path.dirname(hooks_path), exist_ok=True)
-    hooks_data = {}
-    if os.path.exists(hooks_path):
-        try:
-            with open(hooks_path, "r", encoding="utf-8") as f:
-                hooks_data = json.load(f)
-        except json.JSONDecodeError as e:
-            sys.exit(f"Codex hooks file exists but is not valid JSON ({e}). Fix it, then re-run.")
-        except OSError as e:
-            sys.exit(f"can't read {hooks_path} ({e}). Fix the permissions, then re-run.")
-    if not isinstance(hooks_data, dict):
-        sys.exit(f"Codex hooks file must contain a JSON object: {hooks_path}")
-    hooks = hooks_data.setdefault("hooks", {})
-    if not isinstance(hooks, dict):
-        sys.exit(f"Codex hooks field must be a JSON object: {hooks_path}")
-
-    changed = False
-    for event, (command, timeout) in commands.items():
-        groups = hooks.setdefault(event, [])
-        if not isinstance(groups, list):
-            sys.exit(f"Codex hook event {event} must contain an array: {hooks_path}")
-        managed = []
-        for group in groups:
-            if not isinstance(group, dict):
-                continue
-            handlers = group.get("hooks", [])
-            if not isinstance(handlers, list):
-                continue
-            for handler in handlers:
-                if isinstance(handler, dict) and _cmd_has(handler.get("command", ""), "engrim"):
-                    managed.append(handler)
-        if managed:
-            for handler in managed:
-                desired = {"type": "command", "command": command, "timeout": timeout}
-                if handler != desired:
-                    handler.clear()
-                    handler.update(desired)
-                    changed = True
-            print(f"✓ {event} Codex hook already present in {hooks_path}")
-        else:
-            groups.append({"hooks": [{"type": "command", "command": command, "timeout": timeout}]})
-            changed = True
-            print(f"✓ wired {event} Codex hook\n    {command}")
-
-    if changed:
-        tmp = hooks_path + ".engrim-tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(hooks_data, f, indent=2)
-            f.write("\n")
-        os.replace(tmp, hooks_path)
-        print(f"✓ wired Codex hooks in {hooks_path}")
-    else:
-        print(f"✓ Codex hooks already current in {hooks_path}")
-    print("! review and trust these hooks in Codex with /hooks before they run")
+def _setup_codex(engrim_bin: str, dry_run: bool = False, with_mcp: bool = False) -> None:
+    """Wire Codex to Engrim through command hooks and global guidance."""
+    from engrim.hosts.codex import wiring as codex_host
+    codex_host.setup(engrim_bin, with_mcp=with_mcp, dry_run=dry_run)
 
 
 def _setup_claude(conn, a, engrim_bin: str, dry_run: bool = False) -> None:
@@ -1731,6 +1636,7 @@ def cmd_setup(conn, a) -> None:
         getattr(a, "claude", False) or
         getattr(a, "cursor", False) or
         getattr(a, "codex", False) or
+        getattr(a, "codex_mcp", False) or
         getattr(a, "opencode", False) or
         getattr(a, "copilot", False) or
         getattr(a, "all", False) or
@@ -1740,7 +1646,9 @@ def cmd_setup(conn, a) -> None:
     wire_agy = getattr(a, "agy", False) or getattr(a, "all", False)
     wire_claude = getattr(a, "claude", False) or getattr(a, "all", False) or bool(getattr(a, "settings", None))
     wire_cursor = getattr(a, "cursor", False) or getattr(a, "all", False)
-    wire_codex = getattr(a, "codex", False) or getattr(a, "all", False)
+    wire_codex = (getattr(a, "codex", False) or getattr(a, "codex_mcp", False)
+                  or getattr(a, "all", False))
+    wire_codex_mcp = getattr(a, "codex_mcp", False)
     wire_opencode = getattr(a, "opencode", False) or getattr(a, "all", False)
     wire_copilot = getattr(a, "copilot", False) or getattr(a, "all", False)
 
@@ -1788,7 +1696,7 @@ def cmd_setup(conn, a) -> None:
     if wire_copilot:
         copilot_host.setup(engrim_bin, dry_run=dry_run)
     if wire_codex:
-        _setup_codex(engrim_bin, dry_run=dry_run)
+        _setup_codex(engrim_bin, dry_run=dry_run, with_mcp=wire_codex_mcp)
 
     if not dry_run and os.environ.get("ENGRIM_EMBED", "").strip().lower() not in ("0", "off", "none", "false", "no", "lexical"):
         print("\nPreparing semantic recall (first run downloads a small embedding model)…")
@@ -1825,8 +1733,9 @@ def cmd_setup(conn, a) -> None:
         print("\nDone. Open a NEW Claude Code session (or run /hooks to reload) and your project "
               "memory will auto-load. Try: engrim add -t fact -s \"hello world\" ; engrim context")
     if wire_codex and not dry_run:
-        print("\nCodex hooks are installed. Open Codex and use /hooks to review and trust them; "
-              "memory will load on the next session.")
+        mcp_note = " Use /mcp to verify the Engrim server." if wire_codex_mcp else ""
+        print("\nCodex hooks and AGENTS.md guidance are ready. Open Codex and use "
+              f"/hooks to review and trust the hooks.{mcp_note} Start a new session to load them.")
 
     print("\nUniversal memory setup complete.")
 
@@ -2021,72 +1930,16 @@ def _uninstall_claude(a, dry_run: bool = False) -> None:
 
 
 def _uninstall_codex(dry_run: bool = False) -> None:
-    """Remove only the command hooks that setup owns; leave Codex config and MCP untouched."""
-    print("Unwiring Codex CLI environment…")
-    hooks_path = os.path.join(_codex_home(), "hooks.json")
-    if dry_run:
-        print(f"[dry-run] Would unwire Codex hooks in {hooks_path}")
-        return
-    if not os.path.exists(hooks_path):
-        print(f"✓ Codex hooks already unwired from {hooks_path}")
-        return
-
-    try:
-        with open(hooks_path, "r", encoding="utf-8") as f:
-            hooks_data = json.load(f)
-    except json.JSONDecodeError as e:
-        sys.exit(f"Codex hooks file exists but is not valid JSON ({e}). Fix it, then re-run.")
-    if not isinstance(hooks_data, dict):
-        sys.exit(f"Codex hooks file must contain a JSON object: {hooks_path}")
-    hooks = hooks_data.get("hooks", {})
-    if not isinstance(hooks, dict):
-        sys.exit(f"Codex hooks field must be a JSON object: {hooks_path}")
-    changed = False
-    for event in ("SessionStart", "SessionEnd", "Stop", "UserPromptSubmit"):
-        groups = hooks.get(event)
-        if not isinstance(groups, list):
-            continue
-        new_groups = []
-        for group in groups:
-            if not isinstance(group, dict):
-                new_groups.append(group)
-                continue
-            handlers = group.get("hooks", [])
-            if not isinstance(handlers, list):
-                new_groups.append(group)
-                continue
-            new_handlers = [
-                handler for handler in handlers
-                if not (isinstance(handler, dict) and _cmd_has(handler.get("command", ""), "engrim"))
-            ]
-            if len(new_handlers) != len(handlers):
-                changed = True
-            if new_handlers:
-                group["hooks"] = new_handlers
-                new_groups.append(group)
-            else:
-                changed = True
-        if new_groups:
-            hooks[event] = new_groups
-        elif event in hooks:
-            del hooks[event]
-            changed = True
-
-    if changed:
-        tmp = hooks_path + ".engrim-tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(hooks_data, f, indent=2)
-            f.write("\n")
-        os.replace(tmp, hooks_path)
-        print(f"✓ unwired Codex hooks from {hooks_path}")
-    else:
-        print(f"✓ Codex hooks already unwired from {hooks_path}")
+    """Remove Engrim-owned Codex integration state."""
+    from engrim.hosts.codex import wiring as codex_host
+    codex_host.uninstall(dry_run=dry_run)
 
 
 def cmd_doctor(conn, a) -> None:
     """Run comprehensive health and configuration diagnostic checks across the database,
     semantic embedding engine, and all supported AI coding agent environments."""
     import platform
+    from engrim.hosts.codex import wiring as codex_host
     from engrim.hosts.opencode import wiring as opencode_host
     from engrim.hosts.copilot.hooks import compatibility_marker
     from engrim.hosts.copilot import wiring as copilot_host
@@ -2311,7 +2164,13 @@ def cmd_doctor(conn, a) -> None:
     # 3e. Codex CLI (~/.codex)
     codex_dir = _codex_home()
     if os.path.isdir(codex_dir):
-        codex_env = {"detected": True, "hooks": {}}
+        codex_env = {
+            "detected": True,
+            "hooks": {},
+            "agents_md": codex_host.guidance_status(),
+            "mcp": codex_host.inspect_mcp(),
+        }
+        expected_codex_hooks = {"SessionStart", "SessionEnd", "Stop", "UserPromptSubmit"}
         hooks_path = os.path.join(codex_dir, "hooks.json")
         if os.path.exists(hooks_path):
             try:
@@ -2331,8 +2190,32 @@ def cmd_doctor(conn, a) -> None:
                         codex_env["hooks"][evt] = {"command": found_cmd, "valid": ok, "reason": reason}
                         if not ok:
                             report["issues"].append(f"Codex CLI {evt} hook broken: {reason}")
+                missing = expected_codex_hooks - set(codex_env["hooks"])
+                for evt in sorted(missing):
+                    report["issues"].append(f"Codex CLI {evt} hook missing")
             except Exception as e:
                 report["issues"].append(f"Failed to read Codex hooks.json: {e}")
+        else:
+            for evt in sorted(expected_codex_hooks):
+                report["issues"].append(f"Codex CLI {evt} hook missing")
+        if not codex_env["agents_md"]["present"]:
+            report["issues"].append(
+                f"Codex CLI managed AGENTS.md guidance missing or invalid: "
+                f"{codex_env['agents_md']['reason']}"
+            )
+        if codex_env["agents_md"]["shadowed"]:
+            report["warnings"].append(
+                "Codex CLI AGENTS.override.md shadows the managed AGENTS.md guidance"
+            )
+        codex_mcp = codex_env["mcp"]
+        if codex_mcp["configured"] is True and codex_mcp["valid"]:
+            ok, reason = check_cmd_bin(f'"{codex_mcp["command"]}"')
+            codex_mcp["valid"] = ok
+            codex_mcp["reason"] = reason
+        if codex_mcp["configured"] is True and not codex_mcp["valid"]:
+            report["issues"].append(f"Codex CLI MCP server broken: {codex_mcp['reason']}")
+        elif codex_mcp["configured"] is None:
+            report["warnings"].append(f"Could not inspect optional Codex MCP server: {codex_mcp['reason']}")
         report["environments"]["codex"] = codex_env
 
     # 3f. GitHub Copilot CLI (~/.copilot)
@@ -2445,7 +2328,7 @@ def cmd_doctor(conn, a) -> None:
         for issue in report["issues"]
         if not issue.startswith("Copilot CLI assistant capture incompatible:")
     ]
-    if do_fix and repairable_issues:
+    def apply_repairs():
         engrim_bin = _hook_bin(shutil.which("engrim") or "engrim")
         if "antigravity" in report["environments"]:
             _setup_agy(engrim_bin, dry_run=False, strict=False)
@@ -2457,14 +2340,22 @@ def cmd_doctor(conn, a) -> None:
             _setup_cursor(engrim_bin, dry_run=False)
             report["fixes"].append("Repaired Cursor MCP server configuration")
         if "codex" in report["environments"]:
-            _setup_codex(engrim_bin, dry_run=False)
-            report["fixes"].append("Repaired Codex CLI command hooks with self-healing PATH fallback")
+            repair_codex_mcp = report["environments"]["codex"]["mcp"].get("configured") is True
+            _setup_codex(engrim_bin, dry_run=False, with_mcp=repair_codex_mcp)
+            report["fixes"].append("Repaired Codex CLI hooks, guidance, and configured MCP state")
         if "opencode" in report["environments"]:
             opencode_host.setup(engrim_bin, dry_run=False)
             report["fixes"].append("Repaired OpenCode plugin & MCP server configuration")
         if "copilot" in report["environments"]:
             copilot_host.setup(engrim_bin, dry_run=False)
             report["fixes"].append("Repaired Copilot CLI hooks & MCP server configuration")
+
+    if do_fix and repairable_issues:
+        if as_json:
+            with contextlib.redirect_stdout(io.StringIO()):
+                apply_repairs()
+        else:
+            apply_repairs()
 
     if as_json:
         print(json.dumps(report, indent=2))
@@ -2518,7 +2409,16 @@ def cmd_doctor(conn, a) -> None:
                 mark = "✓" if hinfo.get("valid") else "✖"
                 fallback_str = " (self-healing fallback: active)" if hinfo.get("has_fallback") else ""
                 print(f"    {mark} {hk_name} hook: {'valid' if hinfo.get('valid') else hinfo.get('reason')}{fallback_str}")
-        if "mcp" in edata and isinstance(edata["mcp"], dict):
+        if env_name == "codex" and "mcp" in edata:
+            mcp = edata["mcp"]
+            if mcp.get("configured") is False:
+                print("    • MCP registration: optional, not configured")
+            elif mcp.get("configured") is None:
+                print(f"    ! MCP registration: not inspected ({mcp.get('reason')})")
+            else:
+                mark = "✓" if mcp.get("valid") else "✖"
+                print(f"    {mark} MCP registration: {'valid' if mcp.get('valid') else mcp.get('reason')}")
+        elif "mcp" in edata and isinstance(edata["mcp"], dict):
             for mpath, minfo in edata["mcp"].items():
                 mark = "✓" if minfo.get("valid") else "✖"
                 print(f"    {mark} MCP server: {minfo.get('command')} ({'valid' if minfo.get('valid') else minfo.get('reason')})")
@@ -2531,6 +2431,13 @@ def cmd_doctor(conn, a) -> None:
         if "plugin" in edata:
             mark = "✓" if edata["plugin"] else "✖"
             print(f"    {mark} Plugin installed: {'yes' if edata['plugin'] else 'missing'}")
+        if "agents_md" in edata:
+            agents_md = edata["agents_md"]
+            mark = "✓" if agents_md.get("present") else "✖"
+            ownership = "managed" if agents_md.get("managed") else "user-owned"
+            print(f"    {mark} AGENTS.md guidance: {ownership if agents_md.get('present') else agents_md.get('reason')}")
+            if agents_md.get("shadowed"):
+                print("    ! AGENTS.override.md shadows the managed guidance")
         if "assistant_capture" in edata:
             capture = edata["assistant_capture"]
             if capture.get("healthy"):
@@ -4047,13 +3954,15 @@ def build_parser() -> argparse.ArgumentParser:
     pse.add_argument("--cursor", dest="cursor", action="store_true",
                      help="add engrim MCP entry to Cursor mcp.json")
     pse.add_argument("--codex", dest="codex", action="store_true",
-                     help="wire Codex CLI command hooks (MCP is optional and not required)")
+                     help="wire Codex CLI command hooks and managed AGENTS.md guidance")
+    pse.add_argument("--codex-mcp", dest="codex_mcp", action="store_true",
+                     help="wire Codex hooks and guidance, and register the optional MCP server")
     pse.add_argument("--opencode", dest="opencode", action="store_true",
                      help="write the OpenCode plugin, register the MCP server, and add AGENTS.md notes")
     pse.add_argument("--copilot", "--copilot-cli", dest="copilot", action="store_true",
                      help="wire Copilot CLI hooks, register the MCP server, and add instructions notes")
     pse.add_argument("--all", dest="all", action="store_true",
-                     help="configure all detected agent environments")
+                     help="configure all detected agent environments (Codex MCP stays opt-in)")
     pse.add_argument("--dry-run", action="store_true",
                      help="display planned configurations without modifying disk")
     pse.add_argument("--settings", help="path to settings.json (default ~/.claude/settings.json)")
@@ -4069,7 +3978,7 @@ def build_parser() -> argparse.ArgumentParser:
     pun.add_argument("--cursor", dest="cursor", action="store_true",
                      help="remove engrim MCP entry from Cursor mcp.json")
     pun.add_argument("--codex", dest="codex", action="store_true",
-                     help="remove Codex CLI hooks and MCP")
+                     help="remove Codex CLI hooks, managed guidance, and optional MCP entry")
     pun.add_argument("--opencode", dest="opencode", action="store_true",
                      help="remove the OpenCode plugin, MCP entry, and AGENTS.md notes")
     pun.add_argument("--copilot", "--copilot-cli", dest="copilot", action="store_true",

@@ -42,7 +42,7 @@ graph TD
         AGY["Google Antigravity<br/>(PreInvocation & Stop Hooks)"]
         CLAUDE["Claude Code<br/>(SessionStart & Stop Hooks)"]
         CURSOR["Cursor / Windsurf<br/>(Model Context Protocol stdio)"]
-        CODEX["Codex CLI<br/>(Native command hooks)"]
+        CODEX["Codex CLI<br/>(Hooks, guidance & optional MCP)"]
         OPENCODE["OpenCode<br/>(Plugin & MCP)"]
         COPILOT["GitHub Copilot CLI<br/>(Command hooks & MCP)"]
     end
@@ -64,7 +64,7 @@ graph TD
     AGY <-->|"hook / CLI"| ADAPTERS
     CLAUDE <-->|"hook / CLI"| ADAPTERS
     CURSOR <-->|"JSON-RPC (stdio)"| ADAPTERS
-    CODEX <-->|"command hook"| ADAPTERS
+    CODEX <-->|"command hook / MCP"| ADAPTERS
     OPENCODE <-->|"plugin / MCP"| ADAPTERS
     COPILOT <-->|"command hook / MCP"| ADAPTERS
     ADAPTERS --> PROVENANCE
@@ -101,7 +101,7 @@ engrim setup
 - If `~/.gemini` exists $\rightarrow$ wires Antigravity lifecycle hooks, skill, and MCP server.
 - If `~/.claude` exists $\rightarrow$ wires Claude Code SessionStart, Stop, status line, and CLAUDE.md.
 - If `~/.cursor` exists $\rightarrow$ generates and merges Cursor MCP configuration.
-- If `~/.codex` exists $\rightarrow$ wires Codex CLI native command hooks.
+- If `~/.codex` exists $\rightarrow$ wires Codex CLI native command hooks and managed global `AGENTS.md` guidance. MCP stays opt-in.
 - If `~/.config/opencode` exists $\rightarrow$ writes OpenCode plugin, registers MCP server, and adds `AGENTS.md` notes.
 - If `~/.copilot` exists $\rightarrow$ wires Copilot CLI hooks and the Engrim status line, registers the MCP server, and adds `copilot-instructions.md` notes.
 
@@ -154,6 +154,13 @@ Project    : /workspace/my-project
     ✓ SessionEnd hook: valid
     ✓ Stop hook: valid
     ✓ UserPromptSubmit hook: valid
+  Codex CLI (~/.codex):
+    ✓ SessionStart hook: valid
+    ✓ SessionEnd hook: valid
+    ✓ Stop hook: valid
+    ✓ UserPromptSubmit hook: valid
+    ✓ Managed AGENTS.md guidance: present
+    • MCP registration: optional, not configured
   GitHub Copilot CLI (~/.copilot):
     ✓ sessionStart hook: valid
     ✓ userPromptSubmitted hook: valid
@@ -211,8 +218,20 @@ For Windsurf, add `engrim` to `~/.codeium/windsurf/mcp_config.json`:
 ```bash
 engrim setup --codex
 ```
-- Wires `SessionStart`, `SessionEnd`, `Stop`, and `UserPromptSubmit` command hooks in `~/.codex/hooks.json`.
-- Calls local `engrim` CLI directly (MCP not required). Hooks must be reviewed and trusted with Codex's `/hooks` command before they run.
+- Wires `SessionStart`, `SessionEnd`, `Stop`, and `UserPromptSubmit` command hooks in `$CODEX_HOME/hooks.json` (`~/.codex` by default).
+- Adds or updates an Engrim-owned block in `$CODEX_HOME/AGENTS.md`. Existing instructions and symbolic links remain unchanged. If the file already has an unmarked `## Project Memory (engrim)` section, setup treats it as user-owned and does not add a duplicate. A non-empty `AGENTS.override.md` is not modified, but setup warns that it shadows the guidance.
+- Calls the local `engrim` CLI directly, so MCP is not required. Hooks must be reviewed and trusted with Codex's `/hooks` command before they run.
+
+To expose the `engrim_*` tools to Codex, enable the optional MCP server:
+
+```bash
+engrim setup --codex-mcp
+# Equivalent: engrim setup --codex --codex-mcp
+```
+
+This uses Codex's supported `codex mcp add` command and preserves unrelated `config.toml` settings. Use `/mcp` to verify the server, then open a new Codex session so the hooks and guidance load.
+
+`engrim uninstall --codex` removes only Engrim hooks, the managed guidance block, and the `mcp_servers.engrim` entry. It preserves all other Codex settings and instructions.
 
 #### 🤖 GitHub Copilot CLI
 ```bash
@@ -257,6 +276,7 @@ See [`examples/gh-aw/`](examples/gh-aw/) for engrim inside [GitHub Agentic Workf
 ```bash
 engrim setup --all
 ```
+`--all` configures Codex hooks and guidance but does not opt in to the Codex MCP server. Add `--codex-mcp` explicitly when you want that tool interface.
 *(Use `--dry-run` with any setup command to preview changes without writing to disk).*
 
 ---
@@ -275,7 +295,7 @@ In production testing on an active algorithmic trading codebase running real cap
 ## 5. Agent Provenance Tracking
 
 When multiple agents collaborate on a single codebase, provenance matters. `engrim` records the origin of every memory entry with the `origin_agent` field:
-- Allowed values: `antigravity`, `claude-code`, `cursor`, `opencode`, `copilot`, `cli`, or `user`.
+- Allowed values: `antigravity`, `claude-code`, `cursor`, `codex`, `opencode`, `copilot`, `cli`, or `user`.
 - Automatically populated based on the active hook, MCP client, or CLI session.
 - Subtly surfaced in `engrim context` and `engrim list`:
 
@@ -326,7 +346,7 @@ engrim serve --mcp
 | `engrim context` | `engrim context [-b 4000]` | Priority-ordered, budget-capped session-boot pack. |
 | `engrim doctor` | `engrim doctor [--fix] [--json]` | Comprehensive health & environment diagnostic across SQLite, semantic engine, and hooks (`--fix` auto-repairs paths). |
 | `engrim hook` | `engrim hook --agent agy --event boot` | Agent lifecycle hook runner for Claude Code, Antigravity, Codex, Copilot CLI, and OpenCode (`--agent opencode --event boot\|prompt\|stop`). |
-| `engrim setup` | `engrim setup [--agy\|--claude\|--cursor\|--codex\|--opencode\|--copilot\|--all] [--strict]` | Universal multi-agent environment configuration (`--strict` wires gate mode). |
+| `engrim setup` | `engrim setup [--agy\|--claude\|--cursor\|--codex\|--codex-mcp\|--opencode\|--copilot\|--all] [--strict]` | Universal multi-agent environment configuration. `--codex-mcp` implies `--codex`; `--strict` wires gate mode. |
 | `engrim serve` | `engrim serve --mcp` | Start stdio MCP server for agent integrations. |
 | `engrim review` | `engrim review [--strict]` | "Safe to clear" coverage check: scans logs for uncurated decisions (`--strict` exits 2 if uncaptured). |
 | `engrim prune` | `engrim prune [--keep-days <N> \| --all \| --vacuum]` | Purge old transcript logs and VACUUM the SQLite DB (opt-in retention; off by default). |

@@ -83,6 +83,30 @@ def test_add_then_recall_and_context(tmp_path):
     assert any("retrieval beats" in r["summary"] for r in ctx_res["records"])
 
 
+def test_codex_mcp_client_attributes_writes_to_codex(tmp_path):
+    db = str(tmp_path / "m.db")
+    conn = connect(db)
+
+    response = _run(conn, [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18",
+            "clientInfo": {"name": "codex-cli", "version": "0.155.1"},
+        }},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "engrim_add",
+            "arguments": {"type": "fact", "summary": "written by Codex", "project": "/proj"},
+        }},
+    ])
+
+    added = response[1]["result"]["structuredContent"]
+    assert added["origin_agent"] == "codex"
+    stored = sqlite3.connect(db).execute(
+        "SELECT origin_agent FROM memories WHERE summary = ?", ("written by Codex",)
+    ).fetchone()
+    assert stored == ("codex",)
+
+
 def test_tool_results_include_structured_content_matching_text(tmp_path):
     # Tools advertise outputSchema, so strict clients (OpenCode) require
     # structuredContent alongside the text content.
@@ -211,4 +235,3 @@ def test_context_declares_result_size_hint():
     ctx = next(t for t in TOOLS if t["name"] == "engrim_context")
     size = ctx["_meta"]["anthropic/maxResultSizeChars"]
     assert isinstance(size, int) and 0 < size <= 500_000
-
